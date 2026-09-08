@@ -115,8 +115,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.tree, 1)
 
         hint = QLabel(
-            "Double-clique sur une valeur pour la modifier. Les valeurs modifiées sont marquées en orange. "
-            "Ctrl+R restaure la valeur sélectionnée."
+            "Double-clique sur une valeur pour la modifier. Les chaînes NRBF sont maintenant écrites par chemin, "
+            "y compris quand elles sont dupliquées ou changent de longueur. Les valeurs modifiées sont marquées "
+            "en orange. Ctrl+R restaure la valeur sélectionnée."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -321,7 +322,9 @@ class MainWindow(QMainWindow):
                 self,
                 "Écriture NRBF non sûre",
                 str(exc)
-                + "\n\nPour l'instant, l'écriture est volontairement limitée aux chaînes de même longueur présentes une seule fois dans le flux. Le fichier n'a pas été créé/modifié.",
+                + "\n\nLes chaînes sont écrites et validées par chemin. Les Integer/Float/Boolean "
+                "restent en lecture/modification préparatoire tant que leur writer typé n'est pas terminé. "
+                "Le fichier n'a pas été créé/modifié.",
             )
             self.statusBar().showMessage("Sauvegarde refusée : modification non sûre")
             return
@@ -337,7 +340,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage(
-                f"Sauvegarde modifiée créée : {target.name} — {self._document.modified_count} changement(s)"
+                f"Sauvegarde NRBF validée : {target.name} — {self._document.modified_count} changement(s)"
             )
 
     def _apply_filter(self, text: str) -> None:
