@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QBrush, QColor, QFont
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -19,7 +19,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.save.document import SaveDocument, value_preview, value_type
+from src.save.document import (
+    PathKey,
+    SaveDocument,
+    SaveWriteError,
+    parse_value,
+    value_preview,
+    value_type,
+)
 
 
 class MainWindow(QMainWindow):
@@ -30,6 +37,7 @@ class MainWindow(QMainWindow):
 
         self._current_file: Path | None = None
         self._document: SaveDocument | None = None
+        self._loading_tree = False
 
         self._build_menu()
         self._build_ui()
@@ -54,6 +62,12 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+        edit_menu = self.menuBar().addMenu("Édition")
+        reset_action = QAction("Restaurer la valeur sélectionnée", self)
+        reset_action.setShortcut("Ctrl+R")
+        reset_action.triggered.connect(self.reset_selected_value)
+        edit_menu.addAction(reset_action)
+
     def _build_ui(self) -> None:
         root = QWidget(self)
         layout = QVBoxLayout(root)
@@ -74,9 +88,12 @@ class MainWindow(QMainWindow):
         self.format_label = QLabel("Format : —")
         self.class_label = QLabel("Classe : —")
         self.members_label = QLabel("Champs : —")
+        self.modified_label = QLabel("Modifiés : 0")
         info.addWidget(self.format_label)
         info.addWidget(self.class_label, 1)
         info.addWidget(self.members_label)
+        info.addSpacing(20)
+        info.addWidget(self.modified_label)
         layout.addLayout(info)
 
         self.search = QLineEdit()
@@ -94,7 +111,15 @@ class MainWindow(QMainWindow):
         self.tree.setColumnWidth(0, 360)
         self.tree.setColumnWidth(1, 190)
         self.tree.setColumnWidth(2, 650)
+        self.tree.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self.tree, 1)
+
+        hint = QLabel(
+            "Double-clique sur une valeur pour la modifier. Les valeurs modifiées sont marquées en orange. "
+            "Ctrl+R restaure la valeur sélectionnée."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         self.setCentralWidget(root)
 
@@ -130,6 +155,7 @@ class MainWindow(QMainWindow):
         self.class_label.setText(f"Classe : {document.root_class or 'inconnue'}")
         count = document.root_member_count
         self.members_label.setText(f"Champs : {count if count is not None else '—'}")
+        self._update_modified_label()
 
         self._populate_tree(document.data)
         self.statusBar().showMessage(
@@ -137,6 +163,7 @@ class MainWindow(QMainWindow):
         )
 
     def _populate_tree(self, data: Any) -> None:
+        self._loading_tree = True
         self.tree.setUpdatesEnabled(False)
         try:
             self.tree.clear()
@@ -144,20 +171,30 @@ class MainWindow(QMainWindow):
                 for key, value in data.items():
                     if key == "__class__":
                         continue
-                    self._add_value(None, str(key), value)
+                    self._add_value(None, str(key), value, (str(key),))
             else:
-                self._add_value(None, "Racine", data)
+                self._add_value(None, "Racine", data, ())
         finally:
             self.tree.setUpdatesEnabled(True)
+            self._loading_tree = False
 
     def _add_value(
         self,
         parent: QTreeWidgetItem | None,
         name: str,
         value: Any,
+        path: PathKey,
     ) -> QTreeWidgetItem:
         item = QTreeWidgetItem([name, value_type(value), value_preview(value)])
-        item.setData(0, Qt.UserRole, value)
+        item.setData(0, Qt.UserRole, path)
+
+        editable = not isinstance(value, (list, dict)) and path
+        flags = item.flags()
+        if editable:
+            flags |= Qt.ItemIsEditable
+        else:
+            flags &= ~Qt.ItemIsEditable
+        item.setFlags(flags)
 
         if parent is None:
             self.tree.addTopLevelItem(item)
@@ -166,17 +203,100 @@ class MainWindow(QMainWindow):
 
         if isinstance(value, list):
             for index, child in enumerate(value):
-                self._add_value(item, f"[{index}]", child)
+                self._add_value(item, f"[{index}]", child, path + (index,))
         elif isinstance(value, dict):
             for key, child in value.items():
                 if key == "__class__":
                     continue
-                self._add_value(item, str(key), child)
+                self._add_value(item, str(key), child, path + (str(key),))
 
+        self._refresh_item_style(item)
         return item
 
+    def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._loading_tree or column != 2 or self._document is None:
+            return
+
+        path = item.data(0, Qt.UserRole)
+        if not path:
+            return
+
+        original_current = self._document.get_value(path)
+        if isinstance(original_current, (list, dict)):
+            return
+
+        try:
+            new_value = parse_value(item.text(2), original_current)
+        except Exception as exc:
+            self._restore_item_text(item, original_current)
+            QMessageBox.warning(self, "Valeur invalide", str(exc))
+            return
+
+        try:
+            self._document.set_value(path, new_value)
+        except Exception as exc:
+            self._restore_item_text(item, original_current)
+            QMessageBox.warning(self, "Modification impossible", str(exc))
+            return
+
+        self._loading_tree = True
+        try:
+            item.setText(1, value_type(new_value))
+            item.setText(2, value_preview(new_value, max_length=10000))
+            self._refresh_item_style(item)
+        finally:
+            self._loading_tree = False
+
+        self._update_modified_label()
+        self.statusBar().showMessage(f"Valeur modifiée — {self._document.modified_count} changement(s)")
+
+    def _restore_item_text(self, item: QTreeWidgetItem, value: Any) -> None:
+        self._loading_tree = True
+        try:
+            item.setText(2, value_preview(value, max_length=10000))
+        finally:
+            self._loading_tree = False
+
+    def _refresh_item_style(self, item: QTreeWidgetItem) -> None:
+        if self._document is None:
+            return
+        path = item.data(0, Qt.UserRole)
+        modified = bool(path and path in self._document.changes)
+
+        font = QFont(item.font(0))
+        font.setBold(modified)
+        for col in range(3):
+            item.setFont(col, font)
+            item.setForeground(col, QBrush(QColor("#d97706")) if modified else QBrush())
+
+    def reset_selected_value(self) -> None:
+        if self._document is None:
+            return
+        item = self.tree.currentItem()
+        if item is None:
+            return
+        path = item.data(0, Qt.UserRole)
+        if not path or path not in self._document.changes:
+            return
+
+        self._document.reset_value(path)
+        value = self._document.get_value(path)
+        self._loading_tree = True
+        try:
+            item.setText(1, value_type(value))
+            item.setText(2, value_preview(value, max_length=10000))
+            self._refresh_item_style(item)
+        finally:
+            self._loading_tree = False
+        self._update_modified_label()
+        self.statusBar().showMessage("Valeur restaurée")
+
+    def _update_modified_label(self) -> None:
+        count = self._document.modified_count if self._document is not None else 0
+        self.modified_label.setText(f"Modifiés : {count}")
+
     def save_as(self) -> None:
-        if self._current_file is None:
+        if self._current_file is None or self._document is None:
             QMessageBox.information(self, "SaveEditor", "Charge d'abord une sauvegarde.")
             return
 
@@ -185,7 +305,7 @@ class MainWindow(QMainWindow):
             "Enregistrer sous",
             str(
                 self._current_file.with_name(
-                    self._current_file.stem + "_copy" + self._current_file.suffix
+                    self._current_file.stem + "_edited" + self._current_file.suffix
                 )
             ),
             "Sauvegardes (*.dat *.save *.bin);;Tous les fichiers (*.*)",
@@ -193,15 +313,32 @@ class MainWindow(QMainWindow):
         if not filename:
             return
 
-        # Phase lecture : tant que l'écriture NRBF n'est pas activée, une sauvegarde
-        # sans modification est une copie byte-perfect de l'original.
         target = Path(filename)
-        target.write_bytes(self._current_file.read_bytes())
+        try:
+            self._document.save_as(target)
+        except SaveWriteError as exc:
+            QMessageBox.warning(
+                self,
+                "Écriture NRBF non sûre",
+                str(exc)
+                + "\n\nPour l'instant, l'écriture est volontairement limitée aux chaînes de même longueur présentes une seule fois dans le flux. Le fichier n'a pas été créé/modifié.",
+            )
+            self.statusBar().showMessage("Sauvegarde refusée : modification non sûre")
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Erreur d'écriture", f"{type(exc).__name__}: {exc}")
+            self.statusBar().showMessage("Échec de l'enregistrement")
+            return
 
-        identical = target.read_bytes() == self._current_file.read_bytes()
-        self.statusBar().showMessage(
-            f"Copie enregistrée : {target.name} — byte-perfect={'oui' if identical else 'NON'}"
-        )
+        if self._document.modified_count == 0:
+            identical = target.read_bytes() == self._current_file.read_bytes()
+            self.statusBar().showMessage(
+                f"Copie enregistrée : {target.name} — byte-perfect={'oui' if identical else 'NON'}"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Sauvegarde modifiée créée : {target.name} — {self._document.modified_count} changement(s)"
+            )
 
     def _apply_filter(self, text: str) -> None:
         needle = text.strip().lower()
