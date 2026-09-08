@@ -24,11 +24,9 @@ class SaveEditorApp:
         page.window.min_width = 900
         page.window.min_height = 600
 
-        self.file_picker = ft.FilePicker()
-        self.save_picker = ft.FilePicker()
-        self.file_picker.on_result = self._file_picked
-        self.save_picker.on_result = self._save_picked
-        page.overlay.extend([self.file_picker, self.save_picker])
+        self.file_picker = ft.FilePicker(on_result=self._file_picked)
+        self.save_picker = ft.FilePicker(on_result=self._save_picked)
+        page.services.extend([self.file_picker, self.save_picker])
 
         self.file_label = ft.Text("Aucun fichier chargé", selectable=True, expand=True)
         self.format_label = ft.Text("Format : —")
