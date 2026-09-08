@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import math
+import struct
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,9 +26,7 @@ class Change:
 
 @dataclass(frozen=True)
 class _StringRecordLocation:
-    record_start: int
     length_start: int
-    payload_start: int
     payload_end: int
 
 
@@ -53,7 +54,7 @@ class SaveDocument:
     @property
     def root_member_count(self) -> int | None:
         if isinstance(self.data, dict):
-            return len([key for key in self.data.keys() if key != "__class__"])
+            return len([key for key in self.data if key != "__class__"])
         return None
 
     @property
@@ -61,28 +62,17 @@ class SaveDocument:
         return len(self.changes)
 
     def get_value(self, path: PathKey) -> Any:
-        value = self.data
-        for part in path:
-            value = value[part]
-        return value
+        return _get_path(self.data, path)
 
     def get_original_value(self, path: PathKey) -> Any:
-        value = self.original_data
-        for part in path:
-            value = value[part]
-        return value
+        return _get_path(self.original_data, path)
 
     def set_value(self, path: PathKey, value: Any) -> None:
         if not path:
             raise ValueError("La racine ne peut pas être remplacée.")
-
-        container = self.data
-        for part in path[:-1]:
-            container = container[part]
-        container[path[-1]] = value
-
+        _set_path(self.data, path, value)
         original = self.get_original_value(path)
-        if value == original:
+        if _values_equal(value, original):
             self.changes.pop(path, None)
         else:
             self.changes[path] = Change(path=path, original=original, value=value)
@@ -91,135 +81,90 @@ class SaveDocument:
         self.set_value(path, deepcopy(self.get_original_value(path)))
 
     def save_as(self, target: str | Path) -> None:
-        """Write a modified save while preserving the original NRBF graph.
+        """Apply edits directly to the original NRBF stream and verify each edit.
 
-        Current writer guarantees:
-        - no changes -> byte-perfect copy;
-        - BinaryObjectString values are patched by their decoded object path;
-        - duplicate strings are supported by matching the Nth decoded leaf with the
-          Nth real BinaryObjectString record carrying that exact value;
-        - string UTF-8 length may change: the NRBF 7-bit length prefix is rebuilt;
-        - unsupported primitive edits are refused rather than guessed.
+        The writer never accepts a guessed offset. For every possible binary occurrence
+        of the original value, it creates a candidate stream, decodes it again with the
+        NRBF parser and keeps the candidate only when the *whole decoded object graph*
+        is exactly the graph expected after that edit. This makes duplicate values safe.
 
-        This deliberately edits only the serialized records that we can identify
-        and validate structurally. It does not reserialize the whole object graph.
+        Supported editable leaves: String, Boolean, Integer and Float. Strings may
+        change UTF-8 length because the BinaryObjectString 7-bit length prefix is rebuilt.
         """
         target_path = Path(target)
-        original_raw = self.path.read_bytes()
+        raw = self.path.read_bytes()
 
         if not self.changes:
-            target_path.write_bytes(original_raw)
+            target_path.write_bytes(raw)
             return
 
-        patches: list[tuple[int, int, bytes, str]] = []
-        unsupported: list[str] = []
+        expected = deepcopy(self.original_data)
 
-        # String records can be identified reliably because BinaryObjectString is:
-        # RecordType(0x06), ObjectId(Int32 LE), Length(7-bit), UTF-8 payload.
+        # Stable graph order matters only for reproducibility; every result is validated.
         for change in self.changes.values():
-            old = change.original
-            new = change.value
+            _set_path(expected, change.path, change.value)
+            raw = self._apply_verified_change(raw, change, expected)
 
-            if not isinstance(old, str) or not isinstance(new, str):
-                unsupported.append(
-                    f"{format_path(change.path)} : écriture {type(old).__name__} pas encore supportée"
-                )
-                continue
-
-            old_bytes = old.encode("utf-8")
-            new_bytes = new.encode("utf-8")
-            locations = _find_binary_object_string_records(original_raw, old_bytes)
-            matching_paths = [
-                path
-                for path, value in _iter_leaf_values(self.original_data)
-                if isinstance(value, str) and value == old
-            ]
-
-            if change.path not in matching_paths:
-                unsupported.append(
-                    f"{format_path(change.path)} : chemin introuvable dans l'objet original"
-                )
-                continue
-
-            occurrence = matching_paths.index(change.path)
-            if len(locations) != len(matching_paths):
-                unsupported.append(
-                    f"{format_path(change.path)} : {len(matching_paths)} occurrence(s) décodée(s), "
-                    f"{len(locations)} enregistrement(s) NRBF validé(s)"
-                )
-                continue
-            if occurrence >= len(locations):
-                unsupported.append(
-                    f"{format_path(change.path)} : occurrence NRBF #{occurrence} absente"
-                )
-                continue
-
-            location = locations[occurrence]
-            replacement = _encode_7bit_int(len(new_bytes)) + new_bytes
-            patches.append(
-                (
-                    location.length_start,
-                    location.payload_end,
-                    replacement,
-                    format_path(change.path),
-                )
-            )
-
-        if unsupported:
-            details = "\n".join(f"- {item}" for item in unsupported)
+        # Final full-graph verification before touching the destination file.
+        decoded = _decode(raw)
+        if not _graphs_equal(decoded, self.data):
             raise SaveWriteError(
-                "Certaines modifications ne peuvent pas encore être écrites de façon sûre :\n" + details
-            )
-
-        # Overlap would mean our path-to-record mapping is inconsistent. Refuse.
-        ordered = sorted(patches, key=lambda p: p[0])
-        for previous, current in zip(ordered, ordered[1:]):
-            if previous[1] > current[0]:
-                raise SaveWriteError(
-                    "Deux modifications NRBF se chevauchent : "
-                    f"{previous[3]} et {current[3]}"
-                )
-
-        # Apply from the end so variable-length strings cannot invalidate earlier offsets.
-        raw = bytearray(original_raw)
-        for start, end, replacement, _ in sorted(patches, key=lambda p: p[0], reverse=True):
-            raw[start:end] = replacement
-
-        # Validate the produced stream immediately with the same parser used on load.
-        # If it cannot be decoded, nothing is written to disk.
-        import io
-
-        try:
-            decoded = nrbf.load(io.BytesIO(bytes(raw)))
-        except Exception as exc:
-            raise SaveWriteError(
-                f"Le flux NRBF modifié ne se redécode pas : {type(exc).__name__}: {exc}"
-            ) from exc
-
-        # Also verify every edited path now resolves to the requested value.
-        validation_errors: list[str] = []
-        for change in self.changes.values():
-            if not isinstance(change.original, str):
-                continue
-            try:
-                actual = _get_path(decoded, change.path)
-            except Exception as exc:
-                validation_errors.append(
-                    f"{format_path(change.path)} : chemin illisible après écriture ({exc})"
-                )
-                continue
-            if actual != change.value:
-                validation_errors.append(
-                    f"{format_path(change.path)} : attendu {change.value!r}, obtenu {actual!r}"
-                )
-
-        if validation_errors:
-            raise SaveWriteError(
-                "Validation après écriture échouée :\n"
-                + "\n".join(f"- {item}" for item in validation_errors)
+                "La validation finale du graphe NRBF a échoué. Aucun fichier n'a été écrit."
             )
 
         target_path.write_bytes(raw)
+
+    def _apply_verified_change(self, raw: bytes, change: Change, expected: Any) -> bytes:
+        old = change.original
+        new = change.value
+        label = format_path(change.path)
+
+        if isinstance(old, str) and isinstance(new, str):
+            candidates = _string_patch_candidates(raw, old, new)
+        elif isinstance(old, bool) and isinstance(new, bool):
+            candidates = _primitive_patch_candidates(raw, old, new, kind="bool")
+        elif isinstance(old, int) and not isinstance(old, bool) and isinstance(new, int) and not isinstance(new, bool):
+            candidates = _primitive_patch_candidates(raw, old, new, kind="int")
+        elif isinstance(old, float) and isinstance(new, (float, int)) and not isinstance(new, bool):
+            candidates = _primitive_patch_candidates(raw, old, float(new), kind="float")
+        else:
+            raise SaveWriteError(
+                f"{label} : type non pris en charge par l'éditeur ({type(old).__name__})."
+            )
+
+        if not candidates:
+            raise SaveWriteError(
+                f"{label} : aucune représentation NRBF candidate de la valeur originale n'a été trouvée."
+            )
+
+        # A bad candidate generally fails decoding or changes another path. Only a
+        # candidate reproducing the complete expected graph is accepted.
+        valid: list[bytes] = []
+        for candidate in candidates:
+            try:
+                decoded = _decode(candidate)
+            except Exception:
+                continue
+            if _graphs_equal(decoded, expected):
+                valid.append(candidate)
+                if len(valid) > 1:
+                    break
+
+        if not valid:
+            raise SaveWriteError(
+                f"{label} : aucune occurrence n'a produit exactement le graphe attendu. "
+                "La modification a été refusée pour éviter de corrompre la sauvegarde."
+            )
+        if len(valid) > 1:
+            raise SaveWriteError(
+                f"{label} : plusieurs écritures binaires produisent le même graphe. "
+                "La modification est ambiguë et a été refusée."
+            )
+        return valid[0]
+
+
+def _decode(raw: bytes) -> Any:
+    return nrbf.load(io.BytesIO(raw))
 
 
 def _get_path(data: Any, path: PathKey) -> Any:
@@ -227,6 +172,13 @@ def _get_path(data: Any, path: PathKey) -> Any:
     for part in path:
         value = value[part]
     return value
+
+
+def _set_path(data: Any, path: PathKey, value: Any) -> None:
+    container = data
+    for part in path[:-1]:
+        container = container[part]
+    container[path[-1]] = value
 
 
 def _iter_leaf_values(value: Any, path: PathKey = ()) -> Iterable[tuple[PathKey, Any]]:
@@ -243,53 +195,139 @@ def _iter_leaf_values(value: Any, path: PathKey = ()) -> Iterable[tuple[PathKey,
     yield path, value
 
 
-def _find_binary_object_string_records(data: bytes, payload: bytes) -> list[_StringRecordLocation]:
-    """Locate validated BinaryObjectString records carrying exactly payload.
+def _graphs_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, float) and isinstance(right, float):
+        if math.isnan(left) and math.isnan(right):
+            return True
+        return left == right
+    if type(left) is not type(right):
+        # nrbf can expose a numeric edit as int/float-compatible in a few primitive
+        # cases; numeric equality is sufficient here as long as bool is excluded.
+        if isinstance(left, (int, float)) and not isinstance(left, bool) and isinstance(right, (int, float)) and not isinstance(right, bool):
+            return left == right
+        return False
+    if isinstance(left, dict):
+        if left.keys() != right.keys():
+            return False
+        return all(_graphs_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(_graphs_equal(a, b) for a, b in zip(left, right))
+    return left == right
 
-    We search payload occurrences, then prove that immediately before each payload
-    there is a valid NRBF BinaryObjectString header and a 7-bit length equal to the
-    payload length. This avoids replacing arbitrary matching bytes elsewhere.
-    """
-    if not payload:
-        # Empty BinaryObjectString payloads have no bytes to search for. Refuse for now.
+
+def _values_equal(left: Any, right: Any) -> bool:
+    return _graphs_equal(left, right)
+
+
+def _string_patch_candidates(raw: bytes, old: str, new: str) -> list[bytes]:
+    old_bytes = old.encode("utf-8")
+    new_bytes = new.encode("utf-8")
+    if old == "":
         return []
 
+    candidates: list[bytes] = []
+    for location in _find_binary_object_string_records(raw, old_bytes):
+        replacement = _encode_7bit_int(len(new_bytes)) + new_bytes
+        candidate = raw[: location.length_start] + replacement + raw[location.payload_end :]
+        candidates.append(candidate)
+    return candidates
+
+
+def _primitive_patch_candidates(raw: bytes, old: Any, new: Any, kind: str) -> list[bytes]:
+    encodings: list[tuple[bytes, bytes]] = []
+
+    if kind == "bool":
+        encodings.append((b"\x01" if old else b"\x00", b"\x01" if new else b"\x00"))
+    elif kind == "int":
+        # BinaryFormatter primitive integral types are little-endian. Try all widths
+        # compatible with both values; the graph-verification step identifies the real one.
+        for fmt, minimum, maximum in (
+            ("<b", -128, 127),
+            ("<B", 0, 255),
+            ("<h", -32768, 32767),
+            ("<H", 0, 65535),
+            ("<i", -(2**31), 2**31 - 1),
+            ("<I", 0, 2**32 - 1),
+            ("<q", -(2**63), 2**63 - 1),
+            ("<Q", 0, 2**64 - 1),
+        ):
+            if minimum <= old <= maximum and minimum <= new <= maximum:
+                encodings.append((struct.pack(fmt, old), struct.pack(fmt, new)))
+    elif kind == "float":
+        for fmt in ("<f", "<d"):
+            try:
+                old_bytes = struct.pack(fmt, old)
+                new_bytes = struct.pack(fmt, new)
+            except (OverflowError, struct.error):
+                continue
+            # Only keep representations that round-trip to the value decoded by nrbf.
+            roundtrip = struct.unpack(fmt, old_bytes)[0]
+            if roundtrip == old:
+                encodings.append((old_bytes, new_bytes))
+    else:
+        return []
+
+    # Remove identical encoding pairs (signed/unsigned often produce the same bytes).
+    unique_pairs: list[tuple[bytes, bytes]] = []
+    seen_pairs: set[tuple[bytes, bytes]] = set()
+    for pair in encodings:
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            unique_pairs.append(pair)
+
+    candidates: list[bytes] = []
+    seen_candidate_hashes: set[bytes] = set()
+
+    for old_bytes, new_bytes in unique_pairs:
+        if old_bytes == new_bytes:
+            continue
+        start = 0
+        occurrences = 0
+        while True:
+            pos = raw.find(old_bytes, start)
+            if pos < 0:
+                break
+            occurrences += 1
+            # Very common one-byte/zero patterns can have thousands of matches. We do
+            # not guess: cap brute-force work and let the user know when a field cannot
+            # be located safely from raw primitive bytes alone.
+            if occurrences > 2500:
+                break
+            candidate = raw[:pos] + new_bytes + raw[pos + len(old_bytes) :]
+            marker = candidate[pos : pos + len(new_bytes)] + pos.to_bytes(8, "little")
+            if marker not in seen_candidate_hashes:
+                seen_candidate_hashes.add(marker)
+                candidates.append(candidate)
+            start = pos + 1
+
+    return candidates
+
+
+def _find_binary_object_string_records(data: bytes, payload: bytes) -> list[_StringRecordLocation]:
     result: list[_StringRecordLocation] = []
     search_from = 0
     while True:
         payload_start = data.find(payload, search_from)
         if payload_start < 0:
             break
-
-        # NRBF 7-bit encoded Int32 uses at most 5 bytes. Try all possible prefix sizes.
         for prefix_size in range(1, 6):
             length_start = payload_start - prefix_size
-            record_start = length_start - 5  # 1 byte record type + 4 byte object id
+            record_start = length_start - 5
             if record_start < 0 or data[record_start] != 0x06:
                 continue
-
             try:
                 decoded_length, consumed = _decode_7bit_int(data, length_start)
             except ValueError:
                 continue
-
-            if consumed != prefix_size or decoded_length != len(payload):
-                continue
-            if length_start + consumed != payload_start:
-                continue
-
-            result.append(
-                _StringRecordLocation(
-                    record_start=record_start,
-                    length_start=length_start,
-                    payload_start=payload_start,
-                    payload_end=payload_start + len(payload),
+            if consumed == prefix_size and decoded_length == len(payload) and length_start + consumed == payload_start:
+                result.append(
+                    _StringRecordLocation(
+                        length_start=length_start,
+                        payload_end=payload_start + len(payload),
+                    )
                 )
-            )
-            break
-
+                break
         search_from = payload_start + 1
-
     return result
 
 
@@ -348,7 +386,7 @@ def parse_value(text: str, original: Any) -> Any:
     if original is None:
         if text.strip().lower() in {"null", "none", ""}:
             return None
-        raise ValueError("Cette valeur null n'est pas encore éditable vers un autre type.")
+        raise ValueError("Une valeur null ne peut pas encore changer de type.")
     raise ValueError(f"Type non éditable : {type(original).__name__}")
 
 
@@ -377,11 +415,10 @@ def value_preview(value: Any, max_length: int = 180) -> str:
     if isinstance(value, list):
         return f"{len(value)} éléments"
     if isinstance(value, dict):
-        count = len([key for key in value.keys() if key != "__class__"])
+        count = len([key for key in value if key != "__class__"])
         return f"{count} champs"
     if isinstance(value, bool):
         return "true" if value else "false"
-
     text = str(value).replace("\r", "\\r").replace("\n", "\\n")
     if len(text) > max_length:
         return text[: max_length - 1] + "…"
