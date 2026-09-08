@@ -6,6 +6,8 @@ from typing import Any
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QBrush, QColor, QFont
 from PySide6.QtWidgets import (
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -13,6 +15,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -23,10 +26,53 @@ from src.save.document import (
     PathKey,
     SaveDocument,
     SaveWriteError,
+    format_path,
     parse_value,
     value_preview,
     value_type,
 )
+
+
+class StringEditorDialog(QDialog):
+    def __init__(self, parent: QWidget, path: PathKey, value: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Éditer {format_path(path)}")
+        self.resize(900, 520)
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel(f"Champ : {format_path(path)}")
+        title.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(title)
+
+        self.length_label = QLabel()
+        layout.addWidget(self.length_label)
+
+        self.editor = QTextEdit()
+        self.editor.setAcceptRichText(False)
+        self.editor.setLineWrapMode(QTextEdit.NoWrap)
+        self.editor.setPlainText(value)
+        self.editor.textChanged.connect(self._update_length)
+        layout.addWidget(self.editor, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Appliquer")
+        buttons.button(QDialogButtonBox.Cancel).setText("Annuler")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_length()
+        self.editor.setFocus()
+
+    def _update_length(self) -> None:
+        text = self.editor.toPlainText()
+        self.length_label.setText(
+            f"Longueur : {len(text)} caractères — {len(text.encode('utf-8'))} octets UTF-8"
+        )
+
+    def value(self) -> str:
+        return self.editor.toPlainText()
 
 
 class MainWindow(QMainWindow):
@@ -105,12 +151,14 @@ class MainWindow(QMainWindow):
         self.tree.setColumnWidth(1, 190)
         self.tree.setColumnWidth(2, 650)
         self.tree.itemChanged.connect(self._on_item_changed)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         layout.addWidget(self.tree, 1)
 
         hint = QLabel(
-            "Double-clique sur une valeur simple pour la modifier. String, Integer, Float et Boolean sont pris en charge. "
-            "À l'enregistrement, chaque modification est réinjectée dans le flux NRBF puis le fichier entier est redécodé "
-            "et comparé au graphe attendu avant d'être écrit. Ctrl+R restaure la valeur sélectionnée."
+            "Double-clique sur une chaîne pour ouvrir sa valeur complète dans l'éditeur. "
+            "Les Integer, Float et Boolean restent modifiables directement dans le tableau. "
+            "Le ‘…’ visible dans la liste n'est qu'un aperçu et n'est jamais utilisé comme valeur d'édition. "
+            "Ctrl+R restaure la valeur sélectionnée."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -170,13 +218,16 @@ class MainWindow(QMainWindow):
     def _add_value(self, parent: QTreeWidgetItem | None, name: str, value: Any, path: PathKey) -> QTreeWidgetItem:
         item = QTreeWidgetItem([name, value_type(value), value_preview(value)])
         item.setData(0, Qt.UserRole, path)
-        editable = isinstance(value, (str, int, float, bool)) and path
+
+        # Les String ne sont jamais éditées inline : la colonne n'affiche qu'un aperçu.
+        editable_inline = isinstance(value, (int, float, bool)) and not isinstance(value, str) and path
         flags = item.flags()
-        if editable:
+        if editable_inline:
             flags |= Qt.ItemIsEditable
         else:
             flags &= ~Qt.ItemIsEditable
         item.setFlags(flags)
+
         if parent is None:
             self.tree.addTopLevelItem(item)
         else:
@@ -192,6 +243,35 @@ class MainWindow(QMainWindow):
         self._refresh_item_style(item)
         return item
 
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._document is None:
+            return
+        path = item.data(0, Qt.UserRole)
+        if not path:
+            return
+        value = self._document.get_value(path)
+        if not isinstance(value, str):
+            return
+
+        dialog = StringEditorDialog(self, path, value)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        new_value = dialog.value()
+        self._document.set_value(path, new_value)
+        self._loading_tree = True
+        try:
+            item.setText(1, value_type(new_value))
+            item.setText(2, value_preview(new_value))
+            item.setToolTip(2, new_value)
+            self._refresh_item_style(item)
+        finally:
+            self._loading_tree = False
+        self._update_modified_label()
+        self.statusBar().showMessage(
+            f"Chaîne modifiée — {len(new_value)} caractères — {self._document.modified_count} changement(s)"
+        )
+
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
         if self._loading_tree or column != 2 or self._document is None:
             return
@@ -199,7 +279,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         current = self._document.get_value(path)
-        if isinstance(current, (list, dict)):
+        if isinstance(current, (list, dict, str)):
             return
         try:
             new_value = parse_value(item.text(2), current)
@@ -250,7 +330,8 @@ class MainWindow(QMainWindow):
         self._loading_tree = True
         try:
             item.setText(1, value_type(value))
-            item.setText(2, value_preview(value, max_length=10000))
+            item.setText(2, value_preview(value))
+            item.setToolTip(2, value if isinstance(value, str) else "")
             self._refresh_item_style(item)
         finally:
             self._loading_tree = False
