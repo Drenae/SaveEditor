@@ -196,7 +196,7 @@ class SaveEditorApp:
             return ft.ExpansionTile(
                 title=title,
                 controls=children,
-                initially_expanded=bool(needle),
+                expanded=bool(needle),
                 tile_padding=ft.Padding.only(left=8, right=8),
                 controls_padding=ft.Padding.only(left=18),
                 bgcolor=ft.Colors.SURFACE_CONTAINER_LOWEST,
