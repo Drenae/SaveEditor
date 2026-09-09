@@ -198,7 +198,6 @@ class SaveEditorApp:
                 controls=children,
                 expanded=bool(needle),
                 tile_padding=ft.Padding.only(left=8, right=8),
-                controls_padding=ft.Padding.only(left=18),
                 bgcolor=ft.Colors.SURFACE_CONTAINER_LOWEST,
                 collapsed_bgcolor=ft.Colors.SURFACE_CONTAINER_LOWEST,
                 shape=ft.RoundedRectangleBorder(radius=0),
