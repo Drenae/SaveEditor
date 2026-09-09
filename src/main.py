@@ -193,7 +193,7 @@ class SaveEditorApp:
                     children.append(control)
 
             title = self._row_content(name, value_type(value), count_text, path, depth, accent, collection=True)
-            return ft.ExpansionTile(
+            tile = ft.ExpansionTile(
                 title=title,
                 controls=children,
                 expanded=bool(needle),
@@ -203,6 +203,10 @@ class SaveEditorApp:
                 collapsed_bgcolor=ft.Colors.SURFACE_CONTAINER_LOWEST,
                 shape=ft.RoundedRectangleBorder(radius=0),
                 collapsed_shape=ft.RoundedRectangleBorder(radius=0),
+            )
+            return ft.Container(
+                content=tile,
+                border=ft.Border(bottom=ft.BorderSide(1, ft.Colors.with_opacity(0.35, ft.Colors.OUTLINE_VARIANT))),
             )
 
         row = self._row_content(name, value_type(value), value_preview(value), path, depth, accent, collection=False)
@@ -224,6 +228,23 @@ class SaveEditorApp:
         collection: bool,
     ) -> ft.Control:
         modified = bool(self.document and path in self.document.changes)
+
+        actions = ft.Container(width=88) if collection else ft.Row([
+            ft.IconButton(
+                ft.Icons.EDIT_OUTLINED,
+                tooltip="Modifier",
+                on_click=lambda e, p=path: self._edit(p),
+                icon_size=19,
+            ),
+            ft.IconButton(
+                ft.Icons.RESTORE,
+                tooltip="Restaurer",
+                on_click=lambda e, p=path: self._reset(p),
+                disabled=not modified,
+                icon_size=19,
+            ),
+        ], width=88, spacing=0, alignment=ft.MainAxisAlignment.END)
+
         return ft.Row([
             ft.Container(
                 content=ft.Text(name, weight=ft.FontWeight.W_600 if collection or modified else ft.FontWeight.NORMAL, color=accent),
@@ -235,22 +256,7 @@ class SaveEditorApp:
                 width=self.TYPE_WIDTH,
             ),
             ft.Text(preview, expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, color=accent),
-            ft.Row([
-                ft.IconButton(
-                    ft.Icons.EDIT_OUTLINED,
-                    tooltip="Modifier",
-                    on_click=None if collection else lambda e, p=path: self._edit(p),
-                    disabled=collection,
-                    icon_size=19,
-                ),
-                ft.IconButton(
-                    ft.Icons.RESTORE,
-                    tooltip="Restaurer",
-                    on_click=lambda e, p=path: self._reset(p),
-                    disabled=not modified,
-                    icon_size=19,
-                ),
-            ], width=88, spacing=0, alignment=ft.MainAxisAlignment.END),
+            actions,
         ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER)
 
     def _has_modified_descendant(self, path: tuple[str | int, ...]) -> bool:
